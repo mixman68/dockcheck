@@ -106,7 +106,7 @@ choosecontainers() {
   while [[ -z "$ChoiceClean" ]]; do
     read -r -p "Enter number(s) separated by comma, [a] for all - [q] to quit: " Choice
     if [[ "$Choice" =~ [qQnN] ]] ; then
-      exit 0
+      return
     elif [[ "$Choice" =~ [aAyY] ]] ; then
       SelectedUpdates=( "${GotUpdates[@]}" )
       ChoiceClean=${Choice//[,.:;]/ }
