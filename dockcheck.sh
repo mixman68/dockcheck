@@ -286,6 +286,7 @@ for i in $(docker ps $Stopped --filter "name=$SearchName" --format '{{.Names}}')
   for e in "${Excludes[@]}" ; do [[ "$i" == "$e" ]] && continue 2 ; done
   ImageId=$(docker inspect "$i" --format='{{.Image}}')
   RepoUrl=$(docker inspect "$i" --format='{{.Config.Image}}')
+  RepoUrl="${RepoUrl%@*}"
   LocalHash=$(docker image inspect "$ImageId" --format '{{.RepoDigests}}')
   # Checking for errors while setting the variable
   if RegHash=$(${t_out} $regbin -v error image digest --list "$RepoUrl" 2>&1) ; then
@@ -359,6 +360,26 @@ if [ -n "$GotUpdates" ] ; then
       [ "$ContUpdateLabel" == "null" ] && ContUpdateLabel=""
       ContRestartStack=$($jqbin -r '."mag37.dockcheck.restart-stack"' <<< "$ContLabels")
       [ "$ContRestartStack" == "null" ] && ContRestartStack=""
+
+      # Check if swarm
+      ContSwarmService=$(docker inspect "$i" --format '{{ index .Config.Labels "com.docker.swarm.service.name" }}')
+      if [ -n "$ContSwarmService" ] ; then
+        # We will do swarm specific thing
+        ContImage="${ContImage%@*}"
+        docker pull "$ContImage"
+        ContNewImage=$(docker inspect "$ContImage" --format '{{index .RepoDigests 0}}')
+
+        # If the node is manager we can update directly
+        if docker info --format '{{.Swarm.ControlAvailable}}' | grep -q true; then
+          docker service update "$ContSwarmService" --image "$ContNewImage"
+        else
+          # The node is not manager print the command
+          SwarmCommand="docker service update \"$ContSwarmService\" --image \"$ContNewImage\""
+          printf "%s\n" "$i is running on non manager node, exec this command on a manager node : '${SwarmCommand}'"
+        fi
+
+        continue
+      fi
 
       # Checking if compose-values are empty - hence started with docker run
       if [ -z "$ContPath" ] ; then
