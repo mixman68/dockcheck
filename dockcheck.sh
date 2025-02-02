@@ -126,6 +126,31 @@ choosecontainers() {
   printf "\n"
 }
 
+# Choose from list function
+chooseservices() {
+  while [[ -z "$ChoiceClean" ]]; do
+    read -r -p "Enter number(s) separated by comma, [a] for all - [q] to quit: " Choice
+    if [[ "$Choice" =~ [qQnN] ]] ; then
+      exit 0
+    elif [[ "$Choice" =~ [aAyY] ]] ; then
+      SelectedUpdates=( "${SwarmGotUpdates[@]}" )
+      ChoiceClean=${Choice//[,.:;]/ }
+    else
+      ChoiceClean=${Choice//[,.:;]/ }
+      for CC in $ChoiceClean ; do
+        if [[ "$CC" -lt 1 || "$CC" -gt $SwarmUpdCount ]] ; then # Reset choice if out of bounds
+          echo "Number not in list: $CC" ; unset ChoiceClean ; break 1
+        else
+          SelectedUpdates+=( "${SwarmGotUpdates[$CC-1]}" )
+        fi
+      done
+    fi
+  done
+  printf "\nUpdating services:\n"
+  printf "%s\n" "${SelectedUpdates[@]}"
+  printf "\n"
+}
+
 datecheck() {
   ImageDate=$($regbin -v error image inspect "$RepoUrl" --format='{{.Created}}' | cut -d" " -f1 )
   ImageAge=$(( ( $(date +%s) - $(date -d "$ImageDate" +%s) )/86400 ))
@@ -256,6 +281,14 @@ for i in "${GotUpdates[@]}"; do
 done
 }
 
+swarm_options() {
+num=1
+for i in "${SwarmGotUpdates[@]}"; do
+  echo "$num) $i"
+  ((num++))
+done
+}
+
 # Listing typed exclusions
 if [[ -n ${Excludes[*]} ]] ; then
   printf "\n%bExcluding these names:%b\n" "$c_blue" "$c_reset"
@@ -282,6 +315,7 @@ fi
 for i in $(docker ps $Stopped --filter "name=$SearchName" --format '{{.Names}}') ; do
   ((RegCheckQue+=1))
   progress_bar "$RegCheckQue" "$ContCount"
+
   # Looping every item over the list of excluded names and skipping
   for e in "${Excludes[@]}" ; do [[ "$i" == "$e" ]] && continue 2 ; done
 
@@ -398,6 +432,99 @@ if [ -n "$GotUpdates" ] ; then
       else
         $DockerBin ${CompleteConfs} ${ContEnvs} up -d ${ContName}
       fi
+    done
+    printf "\n%bAll done!%b\n" "$c_green" "$c_reset"
+    if [[ -z "$AutoPrune" ]] && [[ -z "$AutoUp" ]]; then read -r -p "Would you like to prune dangling images? y/[n]: " AutoPrune ; fi
+    [[ "$AutoPrune" =~ [yY] ]] && docker image prune -f
+  else
+    printf "\nNo updates installed, exiting.\n"
+  fi
+else
+  printf "\nNo updates available, exiting.\n"
+fi
+
+# Swarm services checks
+if docker info --format '{{.Swarm.ControlAvailable}}' | grep -q true; then
+  unset ChoiceClean
+  unset SelectedUpdates
+  RegCheckQue=0
+  printf "\nNode is a swarm manager, check updates on swarm services\n"
+  SwarmServiceCount=$(docker service ls --filter "name=$SearchName" --format '{{.Name}}' | wc -l)
+  for i in $(docker service ls --filter "name=$SearchName" --format '{{.Name}}') ; do
+    ((RegCheckQue+=1))
+    progress_bar "$RegCheckQue" "$SwarmServiceCount"
+    ServiceImage=$(docker service inspect "$i" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
+    RepoUrl="${ServiceImage%@*}"
+    LocalHash="${ServiceImage#*@}"
+    # Checking for errors while setting the variable
+    if RegHash=$(${t_out} $regbin -v error image digest --list "$RepoUrl" 2>&1) ; then
+      RegHash="${RegHash#*@}"
+      if [[ "$LocalHash" = *"$RegHash"* ]] ; then
+        SwarmNoUpdates+=("$i")
+      else
+        if [[ -n "$DaysOld" ]] && ! datecheck ; then
+          SwarmNoUpdates+=("+$i ${ImageAge}d")
+        else
+          SwarmGotUpdates+=("$i")
+        fi
+      fi
+    else
+      # Here the RegHash is the result of an error code
+      SwarmGotErrors+=("$i - ${RegHash}")
+    fi
+  done
+
+fi
+
+# Sort arrays alphabetically
+IFS=$'\n'
+SwarmNoUpdates=($(sort <<<"${SwarmNoUpdates[*]}"))
+SwarmGotUpdates=($(sort <<<"${SwarmGotUpdates[*]}"))
+unset IFS
+
+# Define how many updates are available
+SwarmUpdCount="${#SwarmGotUpdates[@]}"
+
+# List what services got updates or not
+if [[ -n ${SwarmNoUpdates[*]} ]] ; then
+  printf "\n%bServices on latest version:%b\n" "$c_green" "$c_reset"
+  printf "%s\n" "${SwarmNoUpdates[@]}"
+fi
+if [[ -n ${SwarmGotErrors[*]} ]] ; then
+  printf "\n%bServices with errors, won't get updated:%b\n" "$c_red" "$c_reset"
+  printf "%s\n" "${SwarmGotErrors[@]}"
+  printf "%binfo:%b 'unauthorized' often means not found in a public registry.\n" "$c_blue" "$c_reset"
+fi
+if [[ -n ${SwarmGotUpdates[*]} ]] ; then
+   printf "\n%bServices with updates available:%b\n" "$c_yellow" "$c_reset"
+   [[ -z "$AutoUp" ]] && swarm_options || printf "%s\n" "${SwarmGotUpdates[@]}"
+   [[ -n "$Notify" ]] && { [[ $(type -t send_notification) == function ]] && send_notification "${SwarmGotUpdates[@]}" || printf "Could not source notification function.\n" ; }
+fi
+
+# Optionally get updates if there's any for swarm
+if [ -n "$SwarmGotUpdates" ] ; then
+  if [ -z "$AutoUp" ] ; then
+    printf "\n%bChoose what services to update.%b\n" "$c_teal" "$c_reset"
+    chooseservices
+  else
+    SelectedUpdates=( "${GotUpdates[@]}" )
+  fi
+  if [ "$AutoUp" == "${AutoUp#[Nn]}" ] ; then
+    NumberofUpdates="${#SelectedUpdates[@]}"
+    CurrentQue=0
+    for i in "${SelectedUpdates[@]}"
+    do
+      ((CurrentQue+=1))
+      unset CompleteConfs
+      # We will do swarm specific thing
+      ServiceImage=$(docker service inspect "$i" --format '{{.Spec.TaskTemplate.ContainerSpec.Image}}')
+      ServiceImage="${ServiceImage%@*}"
+      docker pull "$ServiceImage"
+      ContNewImageDigest=$(docker inspect "$ServiceImage" --format '{{index .RepoDigests 0}}')
+      ContNewImageDigest="${ContNewImageDigest#*@}"
+
+      printf "\n%bNow updating (%s/%s): %b%s%b\n" "$c_teal" "$CurrentQue" "$NumberofUpdates" "$c_blue" "$i" "$c_reset"
+      docker service update "$i" --image "$ServiceImage@$ContNewImageDigest"
     done
     printf "\n%bAll done!%b\n" "$c_green" "$c_reset"
     if [[ -z "$AutoPrune" ]] && [[ -z "$AutoUp" ]]; then read -r -p "Would you like to prune dangling images? y/[n]: " AutoPrune ; fi
